@@ -1447,6 +1447,56 @@ def test_flash_attn_func_opus_sink_posinf(causal, d, monkeypatch):
     assert (out == 0).all(), "+inf sink attends only the sink, so O must be 0"
 
 
+@pytest.mark.parametrize("grad_on", ["qkv", "sink"])
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_func_sink_requires_grad_rejected(d, grad_on):
+    """A sink modifies the forward softmax but the autograd backward hard-codes
+    sink=None, so a gradient-tracking call must raise rather than silently return
+    sink-free gradients. grad_on="sink" covers the grad-leaf sink with frozen q/k/v --
+    that case bypasses a q/k/v-only guard yet still records the Function. Hardware-
+    independent: the guard fires before backend dispatch, so this covers CK too."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU to build the qkv tensors")
+    torch.manual_seed(0)
+    nheads, nheads_k = 8, 2
+    kw = dict(device="cuda", dtype=dtypes.bf16, requires_grad=grad_on == "qkv")
+    q = torch.randn(2, 64, nheads, d, **kw)
+    k = torch.randn(2, 64, nheads_k, d, **kw)
+    v = torch.randn(2, 64, nheads_k, d, **kw)
+    sink = torch.randn(
+        nheads, device="cuda", dtype=torch.float32, requires_grad=grad_on == "sink"
+    )
+    # grad is enabled by default here (no torch.no_grad()).
+    with pytest.raises(NotImplementedError, match="sink"):
+        aiter.flash_attn_func(q, k, v, causal=False, sink_ptr=sink)
+
+
+@pytest.mark.parametrize("grad_on", ["qkv", "sink"])
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_varlen_func_sink_requires_grad_rejected(d, grad_on):
+    """Same forward-only-sink guard on the varlen entry. A multi-sequence batch
+    skips the single-seq dense route, so this reaches the FlashAttnVarlenFunc guard;
+    match="varlen" confirms that guard fired (not the dense one). grad_on="sink"
+    covers the grad-leaf sink with frozen q/k/v."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU to build the qkv tensors")
+    torch.manual_seed(0)
+    nheads, nheads_k = 8, 2
+    s0, s1 = 32, 48  # two sequences -> not single-seq-routable
+    kw = dict(device="cuda", dtype=dtypes.bf16, requires_grad=grad_on == "qkv")
+    q = torch.randn(s0 + s1, nheads, d, **kw)
+    k = torch.randn(s0 + s1, nheads_k, d, **kw)
+    v = torch.randn(s0 + s1, nheads_k, d, **kw)
+    sink = torch.randn(
+        nheads, device="cuda", dtype=torch.float32, requires_grad=grad_on == "sink"
+    )
+    cu = torch.tensor([0, s0, s0 + s1], dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError, match="varlen"):
+        aiter.flash_attn_varlen_func(
+            q, k, v, cu, cu, max(s0, s1), max(s0, s1), causal=False, sink_ptr=sink
+        )
+
+
 # Single-sequence shapes for the varlen router (batch is always 1 here).
 #   (seqlen_q, seqlen_kv, nheads, nheads_k)
 _OPUS_VARLEN_CASES = [

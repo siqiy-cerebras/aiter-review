@@ -2645,6 +2645,27 @@ class FlashAttnFunc(torch.autograd.Function):
         num_splits: int = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        # A sink enters the softmax denominator in the forward, but the backward below
+        # hard-codes sink=None (as does the varlen Function, which documents the sink as
+        # forward-only) -- so dQ/dK/dV would be computed from the sink-free softmax.
+        # Reject rather than return silently wrong gradients: run under torch.no_grad()
+        # for inference, or call mha_bwd with d_sink directly for training. This is a
+        # backend-agnostic correctness guard, NOT gated by AITER_ENABLE_FMHA_OPUS -- the
+        # sink-free-gradient gap predates and is independent of the opt-in OPUS forward.
+        # A grad leaf other than q/k/v -- sink, bias, alibi_slopes -- still records this
+        # Function, so check every differentiable input, not just is_grad's q/k/v.
+        if (
+            sink_ptr is not None
+            and is_grad_enabled
+            and any(
+                t is not None and t.requires_grad
+                for t in (q, k, v, bias, alibi_slopes, sink_ptr)
+            )
+        ):
+            raise NotImplementedError(
+                "attention sink is not differentiable through flash_attn_func; "
+                "call under torch.no_grad() for inference, or use mha_bwd with d_sink"
+            )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_q_og = q.size(3)
@@ -3412,6 +3433,21 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         sink_ptr=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        # Sink is forward-only here too: the backward hard-codes sink=None, so a
+        # gradient-tracking call with a sink would silently get sink-free dQ/dK/dV.
+        # Reject it (see flash_attn_func; any grad leaf counts -- bias, alibi_slopes, out).
+        if (
+            sink_ptr is not None
+            and is_grad_enabled
+            and any(
+                t is not None and t.requires_grad
+                for t in (q, k, v, bias, alibi_slopes, out, sink_ptr)
+            )
+        ):
+            raise NotImplementedError(
+                "attention sink is not differentiable through flash_attn_varlen_func; "
+                "call under torch.no_grad() for inference, or use mha_varlen_bwd with d_sink"
+            )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_q_og = q.size(-1)
