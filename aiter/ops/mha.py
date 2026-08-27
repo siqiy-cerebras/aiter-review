@@ -482,8 +482,8 @@ def fmha_fwd_bf16_opus_fwd(
             (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
         )
 
-    # `sink` is one fp32 learned logit per query head ([H_q]); it joins the softmax
-    # denominator as a valueless extra key, so it changes O and lse but needs no buffer.
+    # `sink`: one fp32 logit per query head ([H_q]), a valueless extra key in the softmax
+    # denominator -- changes O and lse, needs no buffer.
     _fmha_fwd_bf16_opus_fwd(
         q, k, v, out, bool(causal), float(softmax_scale), lse=lse, sink=sink
     )
@@ -2083,9 +2083,8 @@ def _flash_attn_forward(
         ret = ret and (bias is None and alibi_slopes is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (window_size_left == -1 and window_size_right == -1)
-        # Sinks ARE supported by the symmetric (D_QK == D_V) kernel -- it folds the
-        # per-head logit into the softmax denominator. sink_size (the "first N keys are
-        # sinks" variant) is a different feature and is still unsupported.
+        # The symmetric kernel supports sink_ptr (folded into the denominator); sink_size
+        # (the "first N keys are sinks" variant) is unsupported.
         ret = ret and (sink_size == 0)
         ret = ret and (
             sink_ptr is None
@@ -3736,15 +3735,11 @@ def flash_attn_varlen_func(
             sink_ptr,
         )
 
-    # A varlen batch holding exactly ONE sequence is the same problem as a dense
-    # batch-1 call, so route it to the dense entry -- which is where the OPUS
-    # symmetric-head-dim kernels live (they are batch-mode only). This is what lets a
-    # single-request prefill reach OPUS instead of falling back to CK.
-    #
-    # Detection is deliberately sync-free: cu_seqlens has batch+1 entries so
-    # numel() == 2 means one sequence (metadata only, no D2H), and max_seqlen_* are
-    # already host ints. Reading cu_seqlens values would force a device sync on a
-    # path called once per layer. Multi-sequence batches fall through unchanged.
+    # A one-sequence varlen batch is just a dense batch-1 call, so route it to the dense
+    # entry where the batch-only OPUS symmetric kernels live -- otherwise a single-request
+    # prefill falls back to CK. Detection is sync-free: cu_seqlens.numel() == 2 means one
+    # sequence and max_seqlen_* are host ints, so nothing here reads cu_seqlens values
+    # (a D2H sync on this per-layer path). Multi-sequence batches fall through unchanged.
     def can_route_single_seq_to_dense():
         if get_gfx() != "gfx950" or q.dtype != dtypes.bf16:
             return False
@@ -3754,18 +3749,23 @@ def flash_attn_varlen_func(
             return False
         if q.shape[-1] != v.shape[-1] or q.shape[-1] not in (64, 128):
             return False
-        # exactly one sequence, and it spans the whole packed tensor
+        # exactly one sequence
         if cu_seqlens_q is None or cu_seqlens_k is None:
             return False
         if cu_seqlens_q.numel() != 2 or cu_seqlens_k.numel() != 2:
             return False
-        if q.shape[0] != max_seqlen_q or k.shape[0] != max_seqlen_k:
+        # Q must be exactly the sequence: varlen returns one output row per query row, so
+        # accepting an oversized Q buffer would silently drop rows. K/V may be LONGER --
+        # vLLM's chunked-context path gathers into a fixed-size workspace and describes a
+        # shorter valid range -- so accept K/V >= and slice the valid prefix below.
+        # max_seqlen_k is the true K length here (one sequence, so the batch max IS its
+        # length); rows past it are stale workspace content and must not be attended.
+        if q.shape[0] != max_seqlen_q:
             return False
-        if v.shape[0] != max_seqlen_k:
+        if k.shape[0] < max_seqlen_k or v.shape[0] < max_seqlen_k:
             return False
-        # flash_attn_func has no `out` parameter, and routing here with a caller
-        # buffer would mean a hidden extra copy -- decline instead. (vLLM's extend
-        # path does not pass out=.)
+        # flash_attn_func has no `out=`; routing a caller buffer here would add a hidden
+        # copy, so decline. (vLLM's extend path doesn't pass out=.)
         if out is not None:
             return False
         # everything the dense OPUS gate also rejects
@@ -3783,11 +3783,12 @@ def flash_attn_varlen_func(
         return q.shape[-2] % k.shape[-2] == 0
 
     if can_route_single_seq_to_dense():
-        # unsqueeze is a view: a single packed sequence is already [S, H, D] contiguous.
+        # Q is exact; K/V may be oversized, so slice their valid prefix. Slice + unsqueeze
+        # are both views (a contiguous [S, H, D] prefix), so no copy.
         r = flash_attn_func(
             q.unsqueeze(0),
-            k.unsqueeze(0),
-            v.unsqueeze(0),
+            k[:max_seqlen_k].unsqueeze(0),
+            v[:max_seqlen_k].unsqueeze(0),
             dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
@@ -3796,6 +3797,8 @@ def flash_attn_varlen_func(
             return_lse=return_lse,
             sink_ptr=sink_ptr,
         )
+        # dense out is [1, max_seqlen_q, H, D]; squeeze -> [total_q, H, D] (total_q ==
+        # max_seqlen_q for one sequence), the extent varlen callers expect.
         if return_lse:
             dense_out, lse = r[0], r[1]
             # dense lse is [B, H, S]; varlen callers expect [H, total_q]
