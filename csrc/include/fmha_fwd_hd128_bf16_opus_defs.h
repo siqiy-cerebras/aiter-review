@@ -33,13 +33,14 @@ struct opus_gqa_kargs {
     void* __restrict__ ptr_lse;
     int stride_lse_b;
     int stride_lse_h;
+    // Optional attention sink: one fp32 logit per QUERY head, [H], unit stride -- a
+    // valueless extra key in the softmax denominator (see store_result). nullptr => none.
+    const void* __restrict__ ptr_sink;
 };
 
 // Configuration traits for the GQA kernel (tile sizes, data types, vector lengths,
-// MFMA config). MFMA 32x32x16 bf16, K/V loaded in one shot (no D slicing), which holds
-// for D=64 and D=128 alike — every quantity below is derived from D_TILE_SIZE and stays
-// integral at both. The static_asserts near the end of the struct enforce that rather
-// than relying on this list being kept in sync.
+// MFMA config). Every quantity below derives from D_TILE_SIZE and stays integral at
+// D=64 and D=128; the static_asserts at the end of the struct enforce that.
 template<int Q_TILE_SIZE_ = 32,
         int KV_TILE_SIZE_ = 64,
         int D_TILE_SIZE_ = 128,
@@ -108,9 +109,9 @@ struct opus_gqa_traits {
     static constexpr int smem_padding_16B = 16 / sizeof(D_ATTN);
     static constexpr int smem_padding_64B = 64 / sizeof(D_ATTN);
 
-    // K/V smem padding: K uses 16B padding, V uses 64B padding. Tuned at D=128; kept
-    // identical at D=64 so the port is behaviour-preserving, but it is a tuning knob
-    // (bank-conflict behaviour differs when smem_d_rpt drops from 2 to 1).
+    // K/V smem padding (K 16B, V 64B), unchanged from D=128. NOT independently tunable:
+    // the V store/read layouts hardcode smem_padding_64B, so smem_v_padding must equal it
+    // or the allocation and layouts desync and corrupt results -- change both together.
     static constexpr int smem_k_padding = smem_padding_16B;
     static constexpr int smem_v_padding = smem_padding_64B;
 
@@ -135,8 +136,8 @@ struct opus_gqa_traits {
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
-    // D-generality guards: every derived count above must divide exactly, or the tiling
-    // silently drops work. Checked here so a new D_TILE_SIZE fails at compile time.
+    // Every derived count above must divide exactly or the tiling drops work; assert it
+    // so a new D_TILE_SIZE fails at compile time.
     static_assert(D_TILE_SIZE % D_128B_SIZE == 0, "D_TILE_SIZE must be a multiple of 128B");
     static_assert(SLICE_D % W_K == 0, "SLICE_D must divide the MFMA K (GEMM0_E_K)");
     static_assert(SLICE_D % W_N == 0, "SLICE_D must divide the MFMA N (GEMM1_E_N)");

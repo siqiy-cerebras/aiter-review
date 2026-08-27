@@ -691,6 +691,33 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // label_write_out`. The stagger balancing barrier stays outside it: the no-keys path
     // runs no prologue, so neither wave group owes the other one.
     auto store_result = [&]() {
+        // ── attention sink: one valueless per-head logit in the softmax denominator ──
+        // LOG2_E converts the natural-log sink to the kernel's base-2 exponent.
+        if (kargs.ptr_sink != nullptr) {
+            const D_ACC sink_b2 =
+                reinterpret_cast<const D_ACC*>(kargs.ptr_sink)[h] * D_ACC(LOG2_E);
+            if (l_row > D_ACC(0.0f)) {
+                // Keys present: rebase onto M = max(m_row, sink) so a sink above every
+                // key score can't overflow exp2 (mirrors the sparse OPUS sink path).
+                // v_o/l_row rescale by alpha; sink == M writes the term as exactly 1, so
+                // a +inf sink gives lse = +inf, not exp2(inf - inf) = NaN.
+                const D_ACC m_new = (m_row > sink_b2) ? m_row : sink_b2;
+                const D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_new);
+                const D_ACC sink_term = (sink_b2 >= m_new)
+                                            ? D_ACC(1.0f)
+                                            : __builtin_amdgcn_exp2f(sink_b2 - m_new);
+                l_row = l_row * alpha + sink_term;
+                static_for<o_len>([&](auto i) { v_o[i.value] *= alpha; });
+                m_row = m_new;
+            } else {
+                // No keys: attend only the sink (l_row = 1, v_o already 0, lse = sink).
+                // m_row here is a -1e30 sentinel, not lowest(), so a valid sink below it
+                // must be set directly, not rebased away to lse = -inf.
+                l_row = D_ACC(1.0f);
+                m_row = sink_b2;
+            }
+        }
+
         if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
             constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
             const D_ACC lse = (l_row > D_ACC(0.0f))

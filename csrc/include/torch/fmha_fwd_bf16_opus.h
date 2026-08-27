@@ -3,7 +3,8 @@
 //
 // Shared public API for the OPUS gfx950 bf16 flash-attention forward kernels.
 // A single entry point dispatches (by head dim, inferred from the tensors) to:
-//   * the symmetric  D_QK=128 / D_V=128 kernel (gqa_d128_kernel), batch mode only, or
+//   * the symmetric  D_QK=D_V in {64,128} kernel (gqa_d128_kernel, D_TILE-parameterised),
+//     batch mode only, or
 //   * the asymmetric D_QK=192 / D_V=128 kernel (gqa_d192_v128_kernel), batch + group.
 //
 // This replaces the former per-hd `fmha_fwd_hd128_bf16_opus_fwd`. The kernel/launch
@@ -19,8 +20,8 @@
 //   Group mode  : q [total_q, H, D_QK]  k [total_k, H_KV, D_QK]  v [total_k, H_KV, D_V]
 //                 out [total_q, H, D_V]   (packed / varlen; group = num sequences)
 //
-// Supported head dims: (D_QK, D_V) in {(128,128), (192,128)}. Group mode requires
-// (192,128) (the D=128 kernel is batch only).
+// Supported head dims: (D_QK, D_V) in {(64,64), (128,128), (192,128)}. Group mode
+// requires (192,128) (the symmetric D=64/128 kernels are batch only).
 //
 // `causal` selects the causal mask (bottom-right aligned when seqlen_q != seqlen_kv).
 // `softmax_scale` is applied to Q·K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
@@ -29,7 +30,8 @@
 // float32, contiguous along the query dim:
 //   batch mode: [B, H, N]        group mode: [H, total_q]
 // Rows that see no keys (causal with seqlen_q > seqlen_kv) get -inf, matching
-// torch.logsumexp. Pass std::nullopt to skip it (the kernel then stores nothing).
+// torch.logsumexp -- except with a `sink`, where an empty row's LSE is the sink logit
+// (it attends only the sink). Pass std::nullopt to skip it (the kernel stores nothing).
 //
 // Group / varlen (all four seqstart tensors are int32, length num_groups+1; pass
 // std::nullopt for batch mode):
@@ -49,4 +51,5 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_q_pad = std::nullopt,
                             std::optional<at::Tensor> seqstart_k_pad = std::nullopt,
                             int max_seqlen_q = 0,
-                            int max_seqlen_k = 0);
+                            int max_seqlen_k = 0,
+                            std::optional<at::Tensor> sink = std::nullopt);
