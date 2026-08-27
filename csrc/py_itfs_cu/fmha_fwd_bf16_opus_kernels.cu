@@ -31,7 +31,8 @@ void launch_d128(at::Tensor& q,
                  at::Tensor& out,
                  bool causal,
                  float softmax_scale,
-                 std::optional<at::Tensor>& lse)
+                 std::optional<at::Tensor>& lse,
+                 std::optional<at::Tensor>& sink)
 {
     TORCH_CHECK(q.dim() == 4, "q must be 4-D [B, N, H, D], got ndim=", q.dim());
     TORCH_CHECK(k.dim() == 4, "k must be 4-D [B, N, H_KV, D], got ndim=", k.dim());
@@ -62,7 +63,7 @@ void launch_d128(at::Tensor& q,
     const long long kv_slice_bytes =
         (long long)N_KV * std::max(k.stride(1), v.stride(1)) * 2LL;  // bf16
     TORCH_CHECK(kv_slice_bytes < (1LL << 32),
-                "OPUS D=128: KV byte extent ", kv_slice_bytes,
+                "OPUS D=", D, ": KV byte extent ", kv_slice_bytes,
                 " reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv or use another backend");
 
     if (B == 0 || N == 0 || H == 0) return;
@@ -109,6 +110,18 @@ void launch_d128(at::Tensor& q,
         kargs.ptr_lse      = l.data_ptr();
         kargs.stride_lse_b = static_cast<int>(l.stride(0));
         kargs.stride_lse_h = static_cast<int>(l.stride(1));
+    }
+
+    // Attention sink: one fp32 logit per QUERY head, [H], unit stride; denominator-only,
+    // so no extra output buffer.
+    if (sink.has_value()) {
+        const at::Tensor& s = *sink;
+        TORCH_CHECK(s.device() == q.device(), "sink must be on the same device as q");
+        TORCH_CHECK(s.scalar_type() == at::kFloat, "sink must be float32");
+        TORCH_CHECK(s.dim() == 1 && static_cast<int>(s.size(0)) == H,
+                    "sink must be 1-D [H] matching q head count");
+        TORCH_CHECK(s.stride(0) == 1, "sink must be contiguous");
+        kargs.ptr_sink = s.data_ptr();
     }
 
     HipDeviceGuard guard(q.device().index());
@@ -358,7 +371,8 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_q_pad,
                             std::optional<at::Tensor> seqstart_k_pad,
                             int max_seqlen_q,
-                            int max_seqlen_k)
+                            int max_seqlen_k,
+                            std::optional<at::Tensor> sink)
 {
     TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
@@ -376,8 +390,10 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
     if (D_QK == D_V && (D_QK == 64 || D_QK == 128)) {
         TORCH_CHECK(!is_group, "OPUS symmetric D=", D_QK,
                     " kernel supports batch mode only (no varlen)");
-        launch_d128(q, k, v, out, causal, softmax_scale, lse);
+        launch_d128(q, k, v, out, causal, softmax_scale, lse, sink);
     } else if (D_QK == 192 && D_V == 128) {
+        TORCH_CHECK(!sink.has_value(),
+                    "OPUS D_QK=192/D_V=128 kernel does not support attention sinks");
         launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);

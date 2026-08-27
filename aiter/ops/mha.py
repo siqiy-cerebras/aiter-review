@@ -407,6 +407,7 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     seqstart_k_pad: Tensor | None = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
+    sink: Tensor | None = None,
 ) -> None:
     return None
 
@@ -434,6 +435,7 @@ def _fmha_fwd_bf16_opus_fwd(
     seqstart_k_pad: Tensor | None = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
+    sink: Tensor | None = None,
 ) -> None: ...
 
 
@@ -446,16 +448,22 @@ def fmha_fwd_bf16_opus_fwd(
     out: Tensor | None = None,
     return_lse: bool = False,
     lse: Tensor | None = None,
+    sink: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward (D=128 and
-    D_QK=192/D_V=128). q/k/v are dense bshd [B, S, H, D]; allocates `out`
-    ([B, S, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
-    to Q·K^T internally and handles GQA fan-out.
+    """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward: symmetric
+    D_QK == D_V in {64, 128}, plus D_QK=192/D_V=128. q/k/v are dense bshd [B, S, H, D];
+    allocates `out` ([B, S, H_q, D_v]) if needed and forwards. The kernel applies
+    `softmax_scale` to Q·K^T internally and handles GQA fan-out.
+
+    `sink` is an optional attention sink: one fp32 logit per query head ([H_q]), a
+    valueless extra key in the softmax denominator (attenuates O, raises lse). Supported
+    only on the symmetric kernel; +/-inf are accepted.
 
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([B, H_q, S]
-    float32, natural log; rows that see no keys get -inf), filled when supplied and
-    allocated here when `return_lse` is set. Like `out` it does not change the return
-    type on its own: only `return_lse` does, and then the return is `(out, lse)`.
+    float32, natural log; rows that see no keys get -inf, or the sink logit when a sink is
+    set), filled when supplied and allocated here when `return_lse` is set. Like `out` it
+    does not change the return type on its own: only `return_lse` does, then it is
+    `(out, lse)`.
 
     Varlen / packed inputs go through `fmha_fwd_bf16_opus_varlen_fwd` instead.
     """
@@ -474,7 +482,11 @@ def fmha_fwd_bf16_opus_fwd(
             (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
         )
 
-    _fmha_fwd_bf16_opus_fwd(q, k, v, out, bool(causal), float(softmax_scale), lse=lse)
+    # `sink` is one fp32 learned logit per query head ([H_q]); it joins the softmax
+    # denominator as a valueless extra key, so it changes O and lse but needs no buffer.
+    _fmha_fwd_bf16_opus_fwd(
+        q, k, v, out, bool(causal), float(softmax_scale), lse=lse, sink=sink
+    )
     return (out, lse) if return_lse else out
 
 
@@ -2065,7 +2077,18 @@ def _flash_attn_forward(
         ret = ret and (bias is None and alibi_slopes is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (window_size_left == -1 and window_size_right == -1)
-        ret = ret and (sink_size == 0 and sink_ptr is None)
+        # Sinks ARE supported by the symmetric (D_QK == D_V) kernel -- it folds the
+        # per-head logit into the softmax denominator. sink_size (the "first N keys are
+        # sinks" variant) is a different feature and is still unsupported.
+        ret = ret and (sink_size == 0)
+        ret = ret and (
+            sink_ptr is None
+            or (
+                hdim_q == hdim_v
+                and sink_ptr.dtype == dtypes.fp32
+                and sink_ptr.numel() == nhead_q
+            )
+        )
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (not return_softmax)
         ret = ret and (
@@ -2170,6 +2193,7 @@ def _flash_attn_forward(
             causal=bool(causal),
             out=out,
             lse=softmax_lse if return_lse else None,
+            sink=sink_ptr,
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
@@ -3741,8 +3765,9 @@ def flash_attn_varlen_func(
             return False
         if window_size[0] != -1 or window_size[1] != -1:
             return False
-        if (len(window_size) > 2 and window_size[2] != 0) or sink_ptr is not None:
+        if len(window_size) > 2 and window_size[2] != 0:
             return False
+        # sink_ptr is allowed: the dense symmetric OPUS kernel supports it.
         return q.shape[-2] % k.shape[-2] == 0
 
     if can_route_single_seq_to_dense():
@@ -3757,6 +3782,7 @@ def flash_attn_varlen_func(
             window_size=window_size,
             deterministic=deterministic,
             return_lse=return_lse,
+            sink_ptr=sink_ptr,
         )
         if return_lse:
             dense_out, lse = r[0], r[1]

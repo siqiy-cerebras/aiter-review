@@ -691,6 +691,29 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // label_write_out`. The stagger balancing barrier stays outside it: the no-keys path
     // runs no prologue, so neither wave group owes the other one.
     auto store_result = [&]() {
+        // ── attention sink ────────────────────────────────────────────────────────────
+        // A per-head logit acting as one valueless extra key in the softmax
+        // denominator. Rebase onto M = max(m_row, sink) before folding it in, so a sink
+        // above every key score can't overflow exp2 (mirrors the sparse OPUS sink path);
+        // v_o and l_row rescale by alpha = exp2(m_row - M). LOG2_E converts the
+        // natural-log sink to the kernel's base-2 exponent. No keys (m_row = lowest,
+        // l_row = 0) falls out for free: M = sink, alpha = 0 -> l_row = 1, v_o = 0,
+        // lse = sink.
+        if (kargs.ptr_sink != nullptr) {
+            const D_ACC sink_b2 =
+                reinterpret_cast<const D_ACC*>(kargs.ptr_sink)[h] * D_ACC(LOG2_E);
+            const D_ACC m_new = (m_row > sink_b2) ? m_row : sink_b2;
+            const D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_new);
+            // exp2(sink - M); when the sink is the max the term is exactly 1, computed
+            // directly so a +inf sink gives 1 (not exp2(inf - inf) = NaN, which would
+            // corrupt l_row and emit lse = -inf instead of +inf).
+            const D_ACC sink_term =
+                (sink_b2 >= m_new) ? D_ACC(1.0f) : __builtin_amdgcn_exp2f(sink_b2 - m_new);
+            l_row = l_row * alpha + sink_term;
+            static_for<o_len>([&](auto i) { v_o[i.value] *= alpha; });
+            m_row = m_new;
+        }
+
         if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
             constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
             const D_ACC lse = (l_row > D_ACC(0.0f))
