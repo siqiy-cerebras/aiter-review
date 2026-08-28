@@ -31,7 +31,8 @@ void launch_d128(at::Tensor& q,
                  at::Tensor& out,
                  bool causal,
                  float softmax_scale,
-                 std::optional<at::Tensor>& lse)
+                 std::optional<at::Tensor>& lse,
+                 std::optional<at::Tensor>& sink)
 {
     TORCH_CHECK(q.dim() == 4, "q must be 4-D [B, N, H, D], got ndim=", q.dim());
     TORCH_CHECK(k.dim() == 4, "k must be 4-D [B, N, H_KV, D], got ndim=", k.dim());
@@ -45,11 +46,11 @@ void launch_d128(at::Tensor& q,
     const int H_KV = static_cast<int>(k.size(2));
     const int N_KV = static_cast<int>(k.size(1));      // seqlen_kv (cross-attn: may != N)
 
-    TORCH_CHECK(D == 128, "launch_d128 only compiles D=128, got D=", D);
+    TORCH_CHECK(D == 64 || D == 128, "launch_d_sym compiles D=64 or D=128, got D=", D);
     TORCH_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
     TORCH_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
     TORCH_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
-    TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal D=128");
+    TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal q head dim D");
     TORCH_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
     TORCH_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H && out.size(3) == D,
                 "out shape must match q [B, N, H, D]");
@@ -111,11 +112,27 @@ void launch_d128(at::Tensor& q,
         kargs.stride_lse_h = static_cast<int>(l.stride(1));
     }
 
+    // Attention sinks: one fp32 logit per QUERY head, [H], unit stride. Only the
+    // denominator is affected, so no extra output buffer is needed.
+    if (sink.has_value()) {
+        const at::Tensor& s = *sink;
+        TORCH_CHECK(s.device() == q.device(), "sink must be on the same device as q");
+        TORCH_CHECK(s.scalar_type() == at::kFloat, "sink must be float32");
+        TORCH_CHECK(s.dim() == 1 && static_cast<int>(s.size(0)) == H,
+                    "sink must be 1-D [H] matching q head count");
+        TORCH_CHECK(s.stride(0) == 1, "sink must be contiguous");
+        kargs.ptr_sink = s.data_ptr();
+    }
+
     HipDeviceGuard guard(q.device().index());
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    using TraitsCausal    = opus_gqa_traits<32, 64, 128, 8, true>;
-    using TraitsNonCausal = opus_gqa_traits<32, 64, 128, 8, false>;
+    // Tile shape (Q=32, KV=64, 8 waves) is shared by both head dims; only D_TILE_SIZE
+    // differs, and every derived count in opus_gqa_traits follows from it.
+    using Traits128Causal    = opus_gqa_traits<32, 64, 128, 8, true>;
+    using Traits128NonCausal = opus_gqa_traits<32, 64, 128, 8, false>;
+    using Traits64Causal     = opus_gqa_traits<32, 64, 64, 8, true>;
+    using Traits64NonCausal  = opus_gqa_traits<32, 64, 64, 8, false>;
 
     auto launch = [&](auto traits_tag) {
         using Traits          = decltype(traits_tag);
@@ -127,10 +144,10 @@ void launch_d128(at::Tensor& q,
         HIP_CALL_LAUNCH(hipGetLastError());
     };
 
-    if (causal) {
-        launch(TraitsCausal{});
+    if (D == 128) {
+        if (causal) { launch(Traits128Causal{}); } else { launch(Traits128NonCausal{}); }
     } else {
-        launch(TraitsNonCausal{});
+        if (causal) { launch(Traits64Causal{}); } else { launch(Traits64NonCausal{}); }
     }
 }
 
@@ -354,7 +371,8 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             std::optional<at::Tensor> seqstart_q_pad,
                             std::optional<at::Tensor> seqstart_k_pad,
                             int max_seqlen_q,
-                            int max_seqlen_k)
+                            int max_seqlen_k,
+                            std::optional<at::Tensor> sink)
 {
     TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
@@ -369,15 +387,19 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
     const int D_V  = static_cast<int>(v.size(-1));
     const bool is_group = seqstart_q.has_value() && seqstart_q->numel() > 0;
 
-    if (D_QK == 128 && D_V == 128) {
-        TORCH_CHECK(!is_group, "OPUS D=128 kernel supports batch mode only (no varlen)");
-        launch_d128(q, k, v, out, causal, softmax_scale, lse);
+    if (D_QK == D_V && (D_QK == 64 || D_QK == 128)) {
+        TORCH_CHECK(!is_group, "OPUS symmetric D=", D_QK,
+                    " kernel supports batch mode only (no varlen)");
+        launch_d128(q, k, v, out, causal, softmax_scale, lse, sink);
     } else if (D_QK == 192 && D_V == 128) {
+        TORCH_CHECK(!sink.has_value(),
+                    "OPUS D_QK=192/D_V=128 kernel does not support attention sinks");
         launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);
     } else {
-        TORCH_CHECK(false, "OPUS fwd supports (D_QK,D_V) in {(128,128),(192,128)}, got (",
+        TORCH_CHECK(false,
+                    "OPUS fwd supports (D_QK,D_V) in {(64,64),(128,128),(192,128)}, got (",
                     D_QK, ",", D_V, ")");
     }
 }
