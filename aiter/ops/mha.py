@@ -412,8 +412,8 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
 
 
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
-# the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric D=128
-# kernel (batch only) or the asymmetric D_QK=192/D_V=128 kernel (batch + group/varlen).
+# the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric
+# D_QK = D_V in {64, 128} or the asymmetric D_QK=192/D_V=128 kernel; both do batch+group.
 # Writes `out` (and `lse`, when given) in place, returns None.
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
@@ -499,9 +499,11 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     seqstart_k_pad: Tensor | None = None,
     return_lse: bool = False,
     lse: Tensor | None = None,
+    sink: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (D_QK=192/D_V=128
-    only). q/k/v are packed [total, H, D]; allocates `out` ([total_q, H_q, D_v]) if
+    """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (symmetric
+    D_QK=D_V in {64, 128}, and D_QK=192/D_V=128; `sink` is symmetric-only).
+    q/k/v are packed [total, H, D]; allocates `out` ([total_q, H_q, D_v]) if
     needed and forwards. The kernel applies `softmax_scale` to Q·K^T internally and
     handles GQA fan-out.
 
@@ -549,6 +551,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
         seqstart_k_pad if seqstart_k_pad is not None else seqstart_k,
         int(max_seqlen_q),
         int(max_seqlen_k),
+        sink,
     )
     return (out, lse) if return_lse else out
 
@@ -2631,6 +2634,7 @@ class FlashAttnFunc(torch.autograd.Function):
         cu_seqlens_kv: torch.Tensor | None = None,
         sink_ptr: Tensor | None = None,
         num_splits: int = 0,
+        out: torch.Tensor | None = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -2642,6 +2646,12 @@ class FlashAttnFunc(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+        # A padded head dim would make out_padded wider than the caller's buffer.
+        if out is not None and head_size_v_og % 8 != 0:
+            raise NotImplementedError(
+                "flash_attn_func: out= requires head_dim_v to be a multiple of 8, got "
+                f"{head_size_v_og}"
+            )
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
@@ -2664,6 +2674,7 @@ class FlashAttnFunc(torch.autograd.Function):
             cu_seqlens_kv=cu_seqlens_kv,
             sink_ptr=sink_ptr,  # fwd kernel still uses sink_ptr naming
             num_splits=num_splits,
+            out=out,
         )
         if is_grad:
             assert return_lse
@@ -2791,6 +2802,7 @@ def flash_attn_func(
     cu_seqlens_kv: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
     num_splits: int = 0,
+    out: Tensor | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -2838,6 +2850,8 @@ def flash_attn_func(
             0 (default) lets aiter decide via a heuristic; 1 disables split-K (uses the
             standard CK/ASM dispatch); >=2 forces the native split-K kernel with that many
             splits when that path is applicable, otherwise num_splits is ignored.
+        out: (batch_size, seqlen, nheads, headdim_v). Optional caller-owned output buffer,
+            written in place and returned; mirrors `flash_attn_varlen_func`'s `out`.
     Return:
         out: (batch_size, seqlen, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -2848,6 +2862,11 @@ def flash_attn_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
     if not ENABLE_CK:
+        # The triton entry has no out=; fail loudly rather than leave it unwritten.
+        if out is not None:
+            raise NotImplementedError(
+                "flash_attn_func: out= is not supported on the triton path (ENABLE_CK=0)"
+            )
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
         return flash_attn_func_triton(
@@ -2885,6 +2904,7 @@ def flash_attn_func(
         cu_seqlens_kv,
         sink_ptr,
         num_splits,
+        out,
     )
 
 
@@ -3036,9 +3056,83 @@ def _flash_attn_varlen_forward(
         ret = ret and (max_seqlen_q > 0 and max_seqlen_k > 0)
         return ret
 
+    def _can_impl_fmha_fwd_sym_bf16_opus_varlen():
+        # OPUS gfx950 group/varlen symmetric forward, D_QK == D_V in {64, 128}: the path a
+        # multi-sequence batch takes (the router in flash_attn_varlen_func handles batch-1).
+        # Opt-IN, matching the dense symmetric gate; d192/v128 above is opt-OUT.
+        if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
+            return False
+        ret = get_gfx() == "gfx950"
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (hdim_q == hdim_v and hdim_q in (64, 128))
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (logits_soft_cap == 0.0)
+        ret = ret and (bias is None and alibi_slopes is None)
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        ret = ret and (block_table is None)
+        ret = ret and (not return_softmax)
+        ret = ret and (max_seqlen_q > 0 and max_seqlen_k > 0)
+        # KV padding is unvalidated against this kernel; route it to CK rather than guess.
+        ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
+        # sink_size (the "first N keys are sinks" variant) is a different feature.
+        ret = ret and (sink_size == 0)
+        # Sink IS supported; validate as the launcher reads it so a mismatch falls back.
+        ret = ret and (
+            sink_ptr is None
+            or (
+                sink_ptr.dtype == dtypes.fp32
+                and sink_ptr.numel() == nhead_q
+                and sink_ptr.is_contiguous()
+            )
+        )
+        # The launcher requires out exactly [total_q, nhead_q, hdim_v]; decline anything
+        # else so a mis-shaped buffer falls back instead of tripping its TORCH_CHECK.
+        ret = ret and (
+            out is None
+            or (
+                out.dim() == 3
+                and out.shape[0] == q.shape[0]
+                and out.shape[1] == nhead_q
+                and out.shape[2] == hdim_v
+                and out.dtype == q.dtype
+                and out.stride(-1) == 1
+            )
+        )
+        # KV extent >= 2^32 wraps the kernel's 32-bit soffset. Packed, so stride(0);
+        # max_seqlen_k bounds every group (each is rebased to its own row offset).
+        if ret:
+            kv_stride = max(k.stride(0), v.stride(0))
+            ret = not (max_seqlen_k * kv_stride * k.element_size() >= 1 << 32)
+        return ret
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
+    if _can_impl_fmha_fwd_sym_bf16_opus_varlen():
+        # cu_seqlens_* go to the kernel as device pointers, so this stays sync-free.
+        softmax_lse = torch.empty(
+            (nhead_q, q.size(0)) if return_lse else (0,),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        out = fmha_fwd_bf16_opus_varlen_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=float(softmax_scale),
+            causal=bool(causal),
+            out=out,
+            seqstart_q=cu_seqlens_q,
+            seqstart_k=cu_seqlens_k,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            lse=softmax_lse if return_lse else None,
+            sink=sink_ptr,
+        )
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
         # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
         # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
         # offsets (KV padding). When no padded arrays are given, physical == real.
@@ -3758,11 +3852,16 @@ def flash_attn_varlen_func(
             return False
         if k.shape[0] < max_seqlen_k or v.shape[0] < max_seqlen_k:
             return False
-        # flash_attn_func has no `out` parameter, and routing here with a caller
-        # buffer would mean a hidden extra copy -- decline instead. (vLLM's extend
-        # path does not pass out=.)
+        # Forwarded to the dense entry as a view, so no copy. Requires exactly one output
+        # row per query row (an oversized out would leave a stale tail), plus matching
+        # dtype/heads and contiguity so the unsqueeze below stays a view.
         if out is not None:
-            return False
+            if out.dim() != 3 or out.shape[0] != q.shape[0]:
+                return False
+            if out.shape[-2] != q.shape[-2] or out.shape[-1] != v.shape[-1]:
+                return False
+            if out.dtype != q.dtype or not out.is_contiguous():
+                return False
         # everything the dense OPUS gate also rejects
         if block_table is not None or bias is not None or alibi_slopes is not None:
             return False
@@ -3791,6 +3890,7 @@ def flash_attn_varlen_func(
             deterministic=deterministic,
             return_lse=return_lse,
             sink_ptr=sink_ptr,
+            out=None if out is None else out.unsqueeze(0),
         )
         # Output is [1, max_seqlen_q, H, D]; varlen callers expect [total_q, H, D], and
         # total_q == max_seqlen_q for one sequence, so squeeze yields the right extent.

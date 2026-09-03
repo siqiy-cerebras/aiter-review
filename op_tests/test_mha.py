@@ -1488,3 +1488,275 @@ def test_flash_attn_func_opus_oversized_buffer(
         causal=causal,
         with_sink=True,
     )
+
+
+# ─── out= passthrough: dense entry, and the single-seq varlen router ──────────────
+# The buffer must be written IN PLACE (avoiding a hidden copy is the point) and the
+# routed result must stay bit-identical to the dense op.
+
+_OPUS_OUT_SHAPE = {
+    "seqlen_q": 128,
+    "seqlen_kv": 300,
+    "nheads": 8,
+    "nheads_k": 2,
+    "d": 64,
+}
+
+
+def _opus_out_qkv(seqlen_q, seqlen_kv, nheads, nheads_k, d, packed):
+    torch.manual_seed(0)
+    qs = (seqlen_q, nheads, d) if packed else (1, seqlen_q, nheads, d)
+    kvs = (seqlen_kv, nheads_k, d) if packed else (1, seqlen_kv, nheads_k, d)
+    return (
+        torch.randn(*qs, device="cuda", dtype=dtypes.bf16),
+        torch.randn(*kvs, device="cuda", dtype=dtypes.bf16),
+        torch.randn(*kvs, device="cuda", dtype=dtypes.bf16),
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_out_param(causal):
+    """flash_attn_func(out=...) fills the caller's buffer in place and returns it.
+
+    Deliberately NOT gated on gfx950: every backend in _flash_attn_forward receives
+    `out`, so this also covers the CK fallback on other parts.
+    """
+    q, k, v = _opus_out_qkv(**_OPUS_OUT_SHAPE, packed=False)
+    with torch.no_grad():
+        ref = aiter.flash_attn_func(q, k, v, causal=causal)
+        out = torch.empty_like(ref)
+        got = aiter.flash_attn_func(q, k, v, causal=causal, out=out)
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    assert got.data_ptr() == out.data_ptr(), "out= was not written in place"
+    assert torch.equal(out, ref), "out= changed the result"
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_varlen_out_param(causal, with_sink, monkeypatch):
+    """A single-seq varlen call carrying out= still routes to dense OPUS, with the
+    caller's buffer written in place (no copy)."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    s = _OPUS_OUT_SHAPE
+    q, k, v = _opus_out_qkv(**s, packed=True)
+    sink = _opus_sink(s["nheads"], with_sink)
+    cu_q = torch.tensor([0, s["seqlen_q"]], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, s["seqlen_kv"]], dtype=torch.int32, device="cuda")
+    out = torch.empty(
+        s["seqlen_q"], s["nheads"], s["d"], device="cuda", dtype=dtypes.bf16
+    )
+
+    with torch.no_grad():
+        got = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            s["seqlen_q"],
+            s["seqlen_kv"],
+            causal=causal,
+            sink_ptr=sink,
+            out=out,
+        )
+        ref = fmha_fwd_bf16_opus_fwd(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=s["d"] ** -0.5,
+            causal=causal,
+            sink=sink,
+        )
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    tag = f"opus-varlen-out-d{s['d']}"
+    assert (
+        got.data_ptr() == out.data_ptr()
+    ), f"{tag}: out= buffer was copied, not filled"
+    assert torch.equal(
+        out, ref.squeeze(0)
+    ), f"{tag}: out= path did not route to the dense OPUS kernel"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_varlen_out_param_oversized_rejected(causal, monkeypatch):
+    """An out= with more rows than Q must never be silently accepted.
+
+    A varlen call returns one row per query row, so an oversized out would leave a stale
+    tail. Both OPUS gates decline it and CK rejects it too, so the observable contract is
+    that the call RAISES rather than returning a truncated buffer.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    s = _OPUS_OUT_SHAPE
+    q, k, v = _opus_out_qkv(**s, packed=True)
+    cu_q = torch.tensor([0, s["seqlen_q"]], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, s["seqlen_kv"]], dtype=torch.int32, device="cuda")
+    out = torch.full(
+        (s["seqlen_q"] + 64, s["nheads"], s["d"]),
+        99.0,
+        device="cuda",
+        dtype=dtypes.bf16,
+    )
+
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        aiter.flash_attn_varlen_func(
+            q, k, v, cu_q, cu_k, s["seqlen_q"], s["seqlen_kv"], causal=causal, out=out
+        )
+
+
+# ─── group (varlen) mode on the symmetric OPUS kernel ────────────────────────────
+# A multi-sequence batch is what the single-sequence router cannot reach. Each sequence
+# is checked against a dense OPUS call on that sequence alone, and every sequence's K/V
+# is scaled distinctly so reading past its own seqlen is loud rather than a drift.
+# Bit-equality is the sharp assertion: group mode uses exactly the dense call's tiles,
+# so only the addressing differs.
+
+# Ragged on purpose: non-tile-aligned tails, and a seqlen_q > seqlen_kv group (which
+# makes the causal bottom-right offset negative).
+_OPUS_GROUP_CASES = [
+    ([128, 64], [300, 128]),
+    ([96, 160, 32], [96, 512, 300]),
+    ([64, 128], [512, 64]),  # group 1 has seqlen_q > seqlen_kv
+    ([128, 0, 64], [256, 128, 300]),  # empty middle group -> short-circuit
+]
+_OPUS_GROUP_IDS = [
+    f"g{len(q)}_q{'-'.join(map(str, q))}_k{'-'.join(map(str, k))}"
+    for (q, k) in _OPUS_GROUP_CASES
+]
+
+
+def _run_opus_group_case(q_lens, kv_lens, nheads, nheads_k, d, causal, with_sink):
+    torch.manual_seed(0)
+    total_q, total_k = sum(q_lens), sum(kv_lens)
+    q = torch.randn(total_q, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(total_k, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(total_k, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    # Distinct magnitude per sequence so cross-group leakage is loud, not subtle.
+    koff = 0
+    for i, kl in enumerate(kv_lens):
+        k[koff : koff + kl] *= float(2 * i + 1) * 4.0
+        v[koff : koff + kl] *= float(2 * i + 1) * 4.0
+        koff += kl
+
+    sink = _opus_sink(nheads, with_sink)
+    cu_q = torch.tensor(
+        [0, *itertools.accumulate(q_lens)], dtype=torch.int32, device="cuda"
+    )
+    cu_k = torch.tensor(
+        [0, *itertools.accumulate(kv_lens)], dtype=torch.int32, device="cuda"
+    )
+
+    with torch.no_grad():
+        out, lse = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max(q_lens),
+            max(kv_lens),
+            causal=causal,
+            return_lse=True,
+            sink_ptr=sink,
+        )
+    tag = f"opus-group-d{d}-g{len(q_lens)}" + ("-sink" if with_sink else "")
+    assert tuple(out.shape) == (total_q, nheads, d), f"{tag}: out {tuple(out.shape)}"
+    assert tuple(lse.shape) == (nheads, total_q), f"{tag}: lse {tuple(lse.shape)}"
+
+    # Prefix sums, not a running counter: an empty group still consumes its K/V rows.
+    q_off = [0, *itertools.accumulate(q_lens)]
+    k_off = [0, *itertools.accumulate(kv_lens)]
+    for i, (ql, kl) in enumerate(zip(q_lens, kv_lens)):
+        qo, ko = q_off[i], k_off[i]
+        if ql == 0:
+            continue  # empty group: no rows to compare, the short-circuit wrote nothing
+        with torch.no_grad():
+            ref, ref_lse = fmha_fwd_bf16_opus_fwd(
+                q[qo : qo + ql].unsqueeze(0),
+                k[ko : ko + kl].unsqueeze(0),
+                v[ko : ko + kl].unsqueeze(0),
+                softmax_scale=d**-0.5,
+                causal=causal,
+                sink=sink,
+                return_lse=True,
+            )
+        assert torch.equal(out[qo : qo + ql], ref.squeeze(0)), (
+            f"{tag}: group {i} O differs from dense OPUS "
+            "(cross-group leakage, or it fell back to CK)"
+        )
+        assert torch.equal(lse[:, qo : qo + ql], ref_lse.squeeze(0)), (
+            f"{tag}: group {i} LSE differs from dense OPUS "
+            "(packed [H, total_q] offset is wrong)"
+        )
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_lens,kv_lens", _OPUS_GROUP_CASES, ids=_OPUS_GROUP_IDS)
+def test_flash_attn_func_opus_group_varlen(
+    q_lens, kv_lens, causal, d, with_sink, monkeypatch
+):
+    """A multi-sequence varlen batch runs on the symmetric OPUS kernel in group mode,
+    each sequence matching a dense OPUS call on that sequence alone."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        q_lens, kv_lens, nheads=8, nheads_k=2, d=d, causal=causal, with_sink=with_sink
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_group_declines_padded_cu(causal, monkeypatch):
+    """Caller-supplied KV padding is unvalidated for this kernel, so the group gate must
+    decline it and the call must still be numerically correct on the CK fallback."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    d, nheads, nheads_k = 64, 8, 2
+    q_lens, kv_lens = [128, 64], [256, 128]
+    torch.manual_seed(0)
+    q = torch.randn(sum(q_lens), nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(sum(kv_lens), nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(sum(kv_lens), nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    cu_q = torch.tensor(
+        [0, *itertools.accumulate(q_lens)], dtype=torch.int32, device="cuda"
+    )
+    cu_k = torch.tensor(
+        [0, *itertools.accumulate(kv_lens)], dtype=torch.int32, device="cuda"
+    )
+
+    with torch.no_grad():
+        got = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max(q_lens),
+            max(kv_lens),
+            causal=causal,
+            cu_seqlens_q_padded=cu_q.clone(),
+            cu_seqlens_k_padded=cu_k.clone(),
+        )
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    assert tuple(got.shape) == (sum(q_lens), nheads, d)
+
+    qo = ko = 0
+    for ql, kl in zip(q_lens, kv_lens):
+        qd = q[qo : qo + ql].unsqueeze(0)
+        kd = k[ko : ko + kl].unsqueeze(0)
+        vd = v[ko : ko + kl].unsqueeze(0)
+        ref, _, _ = attention_ref(qd, kd, vd, causal=causal)
+        pt, _, _ = attention_ref(
+            qd, kd, vd, causal=causal, upcast=False, reorder_ops=True
+        )
+        tol = max(2 * (pt - ref).abs().max().item(), 0.01)
+        diff = (got[qo : qo + ql] - ref.squeeze(0)).abs().max().item()
+        assert diff <= tol, f"padded-cu fallback is wrong: {diff} > {tol}"
+        qo += ql
+        ko += kl
